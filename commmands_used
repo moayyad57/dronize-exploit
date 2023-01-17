@@ -1,0 +1,4 @@
+mavproxy.py: SiK radio interaction framework
+SiK/Firmware/make: makes the radio files--requires other dependencies
+Sik/Firmware/tools/uploader.py 
+

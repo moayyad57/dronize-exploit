@@ -1,0 +1,650 @@
+// -*- Mode: C; c-basic-offset: 8; -*-
+//
+// Copyright (c) 2011 Michael Smith, All Rights Reserved
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions
+// are met:
+//
+//  o Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+//  o Redistributions in binary form must reproduce the above copyright
+//    notice, this list of conditions and the following disclaimer in
+//    the documentation and/or other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+// FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+// COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+// INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+// (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+// SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+// HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+// STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+// OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+
+///
+/// @file	serial.c
+///
+/// MCS51 Serial port driver with flow control and AT command
+/// parser integration.
+///
+
+#include "serial.h"
+#include "packet.h"
+
+#ifdef CPU_SI1030
+#include "AES/aes.h"
+#endif 
+
+// Serial rx/tx buffers.
+//
+// Note that the rx buffer is much larger than you might expect
+// as we need the receive buffer to be many times larger than the
+// largest possible air packet size for efficient TDM. Ideally it
+// would be about 16x larger than the largest air packet if we have
+// 8 TDM time slots
+//
+
+#ifdef CPU_SI1030
+#define RX_BUFF_MAX 1024 //2048
+#define TX_BUFF_MAX 1024
+#define ENCRYPT_BUFF_MAX 17*60 // 16 bit encrypted packets plus one for size
+static __pdata uint16_t encrypt_buff_start = 400; // Start decrypting more to clear buffer
+static __pdata uint16_t encrypt_buff_end = 500; // End our quick buffer clear
+#else
+#define RX_BUFF_MAX 1850
+#define TX_BUFF_MAX 645
+#endif // CPU_SI1030
+
+__xdata uint8_t rx_buf[RX_BUFF_MAX] = {0};
+__xdata uint8_t tx_buf[TX_BUFF_MAX] = {0};
+#ifdef INCLUDE_AES
+__xdata uint8_t encrypt_buf[ENCRYPT_BUFF_MAX] = {0};
+#endif // INCLUDE_AES
+// FIFO insert/remove pointers
+static volatile __pdata uint16_t				rx_insert, rx_remove;
+static volatile __pdata uint16_t				tx_insert, tx_remove;
+#ifdef CPU_SI1030
+static volatile __pdata uint16_t				encrypt_insert, encrypt_remove;
+#endif
+
+// count of number of bytes we are allowed to send due to a RTS low reading
+static uint8_t rts_count;
+
+// flag indicating the transmitter is idle
+static volatile bool			tx_idle;
+
+// FIFO status
+#define BUF_NEXT_INSERT(_b)	((_b##_insert + 1) == sizeof(_b##_buf)?0:(_b##_insert + 1))
+#define BUF_NEXT_REMOVE(_b)	((_b##_remove + 1) == sizeof(_b##_buf)?0:(_b##_remove + 1))
+#define BUF_FULL(_b)	(BUF_NEXT_INSERT(_b) == (_b##_remove))
+#define BUF_NOT_FULL(_b)	(BUF_NEXT_INSERT(_b) != (_b##_remove))
+#define BUF_EMPTY(_b)	(_b##_insert == _b##_remove)
+#define BUF_NOT_EMPTY(_b)	(_b##_insert != _b##_remove)
+#define BUF_USED(_b)	((_b##_insert >= _b##_remove)?(_b##_insert - _b##_remove):(sizeof(_b##_buf) - _b##_remove) + _b##_insert)
+#define BUF_FREE(_b)	((_b##_insert >= _b##_remove)?(sizeof(_b##_buf) + _b##_remove - _b##_insert):_b##_remove - _b##_insert)
+
+// FIFO insert/remove operations
+//
+// Note that these are nominally interrupt-safe as only one of each
+// buffer's end pointer is adjusted by either of interrupt or regular
+// mode code.  This is violated if printing from interrupt context,
+// which should generally be avoided when possible.
+//
+#define BUF_INSERT(_b, _c)	do { _b##_buf[_b##_insert] = (_c); \
+		_b##_insert = BUF_NEXT_INSERT(_b); } while(0)
+#define BUF_REMOVE(_b, _c)	do { (_c) = _b##_buf[_b##_remove]; \
+		_b##_remove = BUF_NEXT_REMOVE(_b); } while(0)
+#define BUF_PEEK(_b)	_b##_buf[_b##_remove]
+#define BUF_PEEK2(_b)	_b##_buf[BUF_NEXT_REMOVE(_b)]
+#define BUF_PEEKX(_b, offset)	_b##_buf[(_b##_remove+offset) % sizeof(_b##_buf)]
+
+static void			_serial_write(register uint8_t c);
+static void			serial_restart(void);
+static void serial_device_set_speed(register uint8_t speed);
+
+// save and restore serial interrupt. We use this rather than
+// __critical to ensure we don't disturb the timer interrupt at all.
+// minimal tick drift is critical for TDM
+#define ES0_SAVE_DISABLE __bit ES_saved = ES0; ES0 = 0
+#define ES0_RESTORE ES0 = ES_saved
+
+// threshold for considering the rx buffer full
+#define SERIAL_CTS_THRESHOLD_LOW  17
+#define SERIAL_CTS_THRESHOLD_HIGH 34
+
+void
+serial_interrupt(void) __interrupt(INTERRUPT_UART0)
+{
+	register uint8_t	c;
+
+	// check for received byte first
+	if (RI0) {
+		// acknowledge interrupt and fetch the byte immediately
+		RI0 = 0;
+		c = SBUF0;
+
+		// if AT mode is active, the AT processor owns the byte
+		if (at_mode_active) {
+			// If an AT command is ready/being processed, we would ignore this byte
+			if (!at_cmd_ready) {
+				at_input(c);
+			}
+		} else {
+			// run the byte past the +++ detector
+			at_plus_detector(c);
+
+			// and queue it for general reception
+			if (BUF_NOT_FULL(rx)) {
+				BUF_INSERT(rx, c);
+			} else {
+				if (errors.serial_rx_overflow != 0xFFFF) {
+					errors.serial_rx_overflow++;
+				}
+			}
+#ifdef SERIAL_CTS
+			if (BUF_FREE(rx) < SERIAL_CTS_THRESHOLD_LOW) {
+				SERIAL_CTS = true;
+			}
+#endif
+		}
+	}
+
+	// check for anything to transmit
+	if (TI0) {
+		// acknowledge the interrupt
+		TI0 = 0;
+
+		// look for another byte we can send
+		if (BUF_NOT_EMPTY(tx)) {
+#ifdef SERIAL_RTS
+		if (feature_rtscts) {
+				if (SERIAL_RTS && !at_mode_active) {
+						if (rts_count == 0) {
+								// the other end doesn't have room in
+								// its serial buffer
+								tx_idle = true;
+								return;
+						}
+						rts_count--;
+				} else {
+								rts_count = 8;
+				}
+		}
+#endif
+			// fetch and send a byte
+			BUF_REMOVE(tx, c);
+			SBUF0 = c;
+		} else {
+			// note that the transmitter requires a kick to restart it
+			tx_idle = true;
+		}
+	}
+}
+
+
+/// check if RTS allows us to send more data
+///
+void
+serial_check_rts(void)
+{
+	if (BUF_NOT_EMPTY(tx) && tx_idle) {
+		serial_restart();
+	}
+}
+
+void
+serial_init(register uint8_t speed)
+{
+	// disable UART interrupts
+	ES0 = 0;
+
+	// reset buffer state, discard all data
+	rx_insert = 0;
+	rx_remove = 0;
+	tx_insert = 0;
+  tx_remove = 0;
+#ifdef CPU_SI1030
+  encrypt_insert = 0;
+  encrypt_remove = 0;
+#endif
+	tx_idle = true;
+
+	// configure timer 1 for bit clock generation
+	TR1 	= 0;				// timer off
+	TMOD	= (TMOD & ~0xf0) | 0x20;	// 8-bit free-running auto-reload mode
+	serial_device_set_speed(speed);		// device-specific clocking setup
+	TR1	= 1;				// timer on
+
+	// configure the serial port
+	SCON0	= 0x10;				// enable receiver, clear interrupts
+
+#ifdef SERIAL_CTS
+	// setting SERIAL_CTS low tells the other end that we have
+	// buffer space available
+	SERIAL_CTS = false;
+#endif
+
+	// re-enable UART interrupts
+	ES0 = 1;
+}
+
+bool
+serial_write(register uint8_t c)
+{
+	if (serial_write_space() < 1)
+		return false;
+
+	_serial_write(c);
+	return true;
+}
+
+static void
+_serial_write(register uint8_t c) __reentrant
+{
+	ES0_SAVE_DISABLE;
+
+	// if we have space to store the character
+	if (BUF_NOT_FULL(tx)) {
+
+		// queue the character
+		BUF_INSERT(tx, c);
+
+		// if the transmitter is idle, restart it
+		if (tx_idle)
+			serial_restart();
+	} else if (errors.serial_tx_overflow != 0xFFFF) {
+		errors.serial_tx_overflow++;
+	}
+
+	ES0_RESTORE;
+}
+
+#ifdef INCLUDE_AES
+// If on appropriate CPU and encryption configured, then attempt to decrypt it
+bool
+decryptPackets(void)
+{
+  // Encrypted packets arn't bigger than 32 bytes
+  // Limited by packet.c packet_get_next()
+  static __pdata uint8_t len_decrypted;
+  static __xdata uint8_t decrypt_buf[32];
+  
+  if(BUF_NOT_EMPTY(encrypt) && aes_get_encryption_level() > 0)
+  {
+    if (encrypt_buf[encrypt_remove] == 0)
+    {
+      __critical {
+        encrypt_remove = 0;
+      }
+    }
+    if (aes_decrypt(&encrypt_buf[encrypt_remove+1], encrypt_buf[encrypt_remove], decrypt_buf, &len_decrypted) != 0) {
+      panic("error while trying to decrypt data");
+    }
+   
+    // Now send decrypted output to serial buffer
+    serial_write_buf(decrypt_buf, len_decrypted);
+
+    // zero the packet as we read it.
+    len_decrypted = encrypt_buf[encrypt_remove];
+    encrypt_buf[encrypt_remove] = 0;
+    
+    // printf("eb %u:%u!%u - ea ",encrypt_remove, encrypt_insert, len_decrypted);
+    __critical {
+      encrypt_remove += len_decrypted + 1;
+      if (encrypt_remove >= sizeof(encrypt_buf)) {
+        encrypt_remove = 0;
+      }
+    }
+   // printf("%u\n",encrypt_remove);
+    return true;
+  }
+  return false;
+}
+
+void
+serial_decrypt_buf(__xdata uint8_t * buf, __pdata uint8_t count)
+{
+  __pdata uint16_t space;
+
+  if (aes_get_encryption_level() > 0) {
+    // write to the end of the ring buffer or front if we dont have space
+    if (count > sizeof(encrypt_buf) - (encrypt_insert + 1)) {
+      encrypt_insert = 0;
+    }
+
+    // If we don't have enough space at all then exit
+    space = encrypt_buffer_write_space();
+    if (count > space) {
+            if (errors.serial_tx_overflow != 0xFFFF) {
+                    errors.serial_tx_overflow++;
+            }
+            // Have to return, it is ALL or NOTHING. Can't decrypt part of a packet
+            return;
+    }
+
+
+
+    // Insert the length of the packet
+    encrypt_buf[encrypt_insert] = count;
+    //printf("ic %u \n",count, encrypt_insert);
+    memcpy(&encrypt_buf[encrypt_insert+1], buf, count);
+    
+    __critical {
+      encrypt_insert += count + 1;
+      if (encrypt_insert >= sizeof(encrypt_buf)) {
+        encrypt_insert -= sizeof(encrypt_buf);
+      }
+    }
+    // Zero the next packet for the parser.
+    encrypt_buf[encrypt_insert] = 0;
+  }
+  else {
+    serial_write_buf(buf, count);
+  }
+}
+#endif // INCLUDE_AES
+
+// write as many bytes as will fit into the serial transmit buffer
+// if encryption turned on, decrypt the packet.
+void
+serial_write_buf(__xdata uint8_t * buf, __pdata uint8_t count)
+{
+	__pdata uint16_t space;
+	__pdata uint8_t n1;
+
+	if (count == 0) {
+		return;
+	}
+  
+	// discard any bytes that don't fit. We can't afford to
+	// wait for the buffer to drain as we could miss a frequency
+	// hopping transition
+	space = serial_write_space();	
+	if (count > space) {
+		count = space;
+		if (errors.serial_tx_overflow != 0xFFFF) {
+			errors.serial_tx_overflow++;
+		}
+	}
+
+	// write to the end of the ring buffer
+	n1 = count;
+	if (n1 > sizeof(tx_buf) - tx_insert) {
+		n1 = sizeof(tx_buf) - tx_insert;
+	}
+	memcpy(&tx_buf[tx_insert], buf, n1);
+	buf += n1;
+	count -= n1;
+	__critical {
+		tx_insert += n1;
+		if (tx_insert >= sizeof(tx_buf)) {
+			tx_insert -= sizeof(tx_buf);
+		}
+	}
+
+	// add any leftover bytes to the start of the ring buffer
+	if (count != 0) {
+		memcpy(&tx_buf[0], buf, count);
+		__critical {
+			tx_insert = count;
+		}		
+	}
+	__critical {
+		if (tx_idle) {
+			serial_restart();
+		}
+	}
+}
+
+uint16_t
+serial_write_space(void)
+{
+	register uint16_t ret;
+	ES0_SAVE_DISABLE;
+	ret = BUF_FREE(tx);
+	ES0_RESTORE;
+	return ret;
+}
+
+static void
+serial_restart(void)
+{
+#ifdef SERIAL_RTS
+	if (feature_rtscts && SERIAL_RTS && !at_mode_active) {
+		// the line is blocked by hardware flow control
+		return;
+	}
+#endif
+	// generate a transmit-done interrupt to force the handler to send another byte
+	tx_idle = false;
+	TI0 = 1;
+}
+
+uint8_t
+serial_read(void)
+{
+	register uint8_t	c;
+
+	ES0_SAVE_DISABLE;
+
+	if (BUF_NOT_EMPTY(rx)) {
+		BUF_REMOVE(rx, c);
+	} else {
+		c = '\0';
+	}
+
+#ifdef SERIAL_CTS
+	if (BUF_FREE(rx) > SERIAL_CTS_THRESHOLD_HIGH) {
+		SERIAL_CTS = false;
+	}
+#endif
+
+	ES0_RESTORE;
+
+	return c;
+}
+
+uint8_t
+serial_peek(void)
+{
+	register uint8_t c;
+
+	ES0_SAVE_DISABLE;
+	c = BUF_PEEK(rx);
+	ES0_RESTORE;
+
+	return c;
+}
+
+uint8_t
+serial_peekx(uint16_t offset)
+{
+	register uint8_t c;
+
+	ES0_SAVE_DISABLE;
+	c = BUF_PEEKX(rx, offset);
+	ES0_RESTORE;
+
+	return c;
+}
+
+// read count bytes from the serial buffer. This implementation
+// tries to be as efficient as possible, while disabling interrupts
+// for as short a time as possible
+bool
+serial_read_buf(__xdata uint8_t * buf, __pdata uint8_t count)
+{
+	__pdata uint16_t n1;
+	// the caller should have already checked this, 
+	// but lets be sure
+	if (count > serial_read_available()) {
+		return false;
+	}
+	// see how much we can copy from the tail of the buffer
+	n1 = count;
+	if (n1 > sizeof(rx_buf) - rx_remove) {
+		n1 = sizeof(rx_buf) - rx_remove;
+	}
+	memcpy(buf, &rx_buf[rx_remove], n1);
+	count -= n1;
+	buf += n1;
+	// update the remove marker with interrupts disabled
+	__critical {
+		rx_remove += n1;
+		if (rx_remove >= sizeof(rx_buf)) {
+			rx_remove -= sizeof(rx_buf);
+		}
+	}
+	// any more bytes to do?
+	if (count > 0) {
+		memcpy(buf, &rx_buf[0], count);
+		__critical {
+			rx_remove = count;
+		}		
+	}
+
+#ifdef SERIAL_CTS
+	__critical {
+		if (BUF_FREE(rx) > SERIAL_CTS_THRESHOLD_HIGH) {
+			SERIAL_CTS = false;
+		}
+	}
+#endif
+	return true;
+}
+
+uint16_t
+serial_read_available(void)
+{
+	register uint16_t ret;
+	ES0_SAVE_DISABLE;
+	ret = BUF_USED(rx);
+	ES0_RESTORE;
+	return ret;
+}
+
+// return available space in rx buffer as a percentage
+uint8_t
+serial_read_space(void)
+{
+	uint16_t space = sizeof(rx_buf) - serial_read_available();
+	space = (100 * (space/8)) / (sizeof(rx_buf)/8);
+	return space;
+}
+
+void
+putchar(char c) __reentrant
+{
+	if (c == '\n')
+		_serial_write('\r');
+	_serial_write(c);
+}
+
+
+///
+/// Table of supported serial speed settings.
+/// the table is looked up based on the 'one byte'
+/// serial rate scheme that APM uses. If an unsupported
+/// rate is chosen then 57600 is used
+///
+static const __code struct {
+	uint8_t rate;
+	uint8_t th1;
+	uint8_t ckcon;
+} serial_rates[] = {
+	{1,   0x2C, 0x02}, // 1200
+	{2,   0x96, 0x02}, // 2400
+	{4,   0x2C, 0x00}, // 4800
+	{9,   0x96, 0x00}, // 9600
+	{19,  0x60, 0x01}, // 19200
+	{38,  0xb0, 0x01}, // 38400
+	{57,  0x2b, 0x08}, // 57600 - default
+	{115, 0x96, 0x08}, // 115200
+	{230, 0xcb, 0x08}, // 230400
+};
+
+//
+// check if a serial speed is valid
+//
+bool 
+serial_device_valid_speed(register uint8_t speed)
+{
+	uint8_t i;
+	uint8_t num_rates = ARRAY_LENGTH(serial_rates);
+
+	for (i = 0; i < num_rates; i++) {
+		if (speed == serial_rates[i].rate) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static 
+void serial_device_set_speed(register uint8_t speed)
+{
+	uint8_t i;
+	uint8_t num_rates = ARRAY_LENGTH(serial_rates);
+
+	for (i = 0; i < num_rates; i++) {
+		if (speed == serial_rates[i].rate) {
+			break;
+		}
+	}
+	if (i == num_rates) {
+		i = 6; // 57600 default
+	}
+
+	// set the rates in the UART
+	TH1 = serial_rates[i].th1;
+	CKCON = (CKCON & ~0x0b) | serial_rates[i].ckcon;
+
+	// tell the packet layer how fast the serial link is. This is
+	// needed for packet framing timeouts
+	packet_set_serial_speed(speed*125UL);	
+}
+
+
+#ifdef INCLUDE_AES
+/// Indicate if encrypt buffer is starting to get too full
+//
+bool
+encrypt_buffer_getting_full()
+{
+	if (BUF_FREE(encrypt) < encrypt_buff_start) {
+           return true;
+        }
+
+ return false;
+}
+
+
+/// Indicate if encrypt before is getting back to a more comfortable lower state
+//
+bool
+encrypt_buffer_getting_empty()
+{
+	if (BUF_FREE(encrypt) > encrypt_buff_end) {
+           return true;
+        }
+ return false;
+}
+
+
+/// Return amount of space left in buffer
+//
+uint16_t
+encrypt_buffer_write_space()
+{
+	register uint16_t ret;
+        ret = BUF_FREE(encrypt);
+        return ret;
+}
+
+
+#endif // INCLUDE_AES

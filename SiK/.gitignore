@@ -1,0 +1,13 @@
+.metadata
+Firmware/bootloader/obj
+Firmware/radio/obj
+Firmware/.cproject
+Firmware/.project
+SiKUploader/uploader/bin
+*.hex
+Firmware/dst
+Firmware/obj
+SiK_Firmware.sublime-project
+SiK_Firmware.sublime-workspace
+Firmware/Docs
+*.xcodeproj
